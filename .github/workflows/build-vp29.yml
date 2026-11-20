@@ -1,0 +1,146 @@
+name: Build VP29 kernel (stock dtb + stock fstab)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - lineage-17.1
+    paths:
+      - '.github/workflows/build-vp29.yml'
+      - 'vp29/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_ARM32: arm-linux-gnueabihf-
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential cpio curl flex libelf-dev \
+            libssl-dev python3 xz-utils zip unzip device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+      - name: Use stock kernel config as baseline
+        run: |
+          cp vp29/vp29_stock_ksu_config .config
+          echo 'CONFIG_LOCALVERSION="-VP29"' >> .config
+          echo '# CONFIG_LOCALVERSION_AUTO is not set' >> .config
+          echo 'CONFIG_KSU=y' >> .config
+          echo 'CONFIG_KSU_KPROBES_KSUD=y' >> .config
+          echo 'CONFIG_KSU_LSM_SECURITY_HOOKS=y' >> .config
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
+          echo '--- effective config ---'
+          grep -E '^CONFIG_(LOCALVERSION=|KSU=|KSU_KPROBES_KSUD|KSU_LSM_SECURITY_HOOKS|ADF_SPRD|DISP_LITE_R2P0|TOUCHSCREEN_CST9217|TOUCHSCREEN_PROPERTIES|ION_SPRD|SECCOMP=|SECURITY_SELINUX=|CMDLINE_FROM_BOOTLOADER|CC_OPTIMIZE_FOR_SIZE|MODULES=|MODVERSIONS=)' .config
+          echo '--- sanity: display/touch/wcn must all be present ---'
+          for sym in CONFIG_ADF_SPRD CONFIG_DISP_LITE_R2P0 CONFIG_TOUCHSCREEN_CST9217 CONFIG_ION_SPRD CONFIG_SPRD_SIPC_WCN; do
+            grep -q "^$sym=y" .config || { echo "MISSING $sym"; exit 1; }
+          done
+          grep -q '^CONFIG_KSU=y' .config || { echo 'KSU not enabled'; exit 1; }
+
+      - name: Build kernel Image
+        run: make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 -j$(nproc) Image
+
+      - name: Build external vendor modules
+        run: |
+          set -e
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/gpu/arm/midgard/mali \
+            CONFIG_MALI_PLATFORM_NAME=sharkle CONFIG_MALI_BOARD_PLATFORM=sharkle CONFIG_MALI_MIDGARD=m modules
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/misc/sprdwcn_bsp/sc2332 \
+            CONFIG_SPRDWL_NG=m modules
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/misc/sprdwcn_bsp/sipc_modules/bluetooth/driver \
+            BSP_BOARD_UNISOC_WCN_SOCKET=sipc modules
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=drivers/misc/sprdwcn_bsp/sipc_modules/fm/driver \
+            BSP_BOARD_UNISOC_WCN_SOCKET=sipc modules
+          find . -path ./.git -prune -o -name '*.ko' -print | sort
+
+      - name: Strip modules
+        run: |
+          set -e
+          for f in \
+            drivers/gpu/arm/midgard/mali/mali.ko \
+            drivers/misc/sprdwcn_bsp/sc2332/sprdwl_ng.ko \
+            drivers/misc/sprdwcn_bsp/sipc_modules/fm/driver/sprd_fm.ko \
+            drivers/misc/sprdwcn_bsp/sipc_modules/bluetooth/driver/sprdbt_tty.ko; do
+            ${CROSS_COMPILE}strip --strip-debug "$f"
+            ls -l "$f"
+          done
+
+      - name: Download stock boot images
+        run: |
+          curl -fL --http1.1 --retry 3 -o /tmp/boot_stock.img \
+            https://github.com/zhx57/android_kernel_sprd_sc9832e/releases/download/vp29-stock-boot/boot_stock.img
+          curl -fL --http1.1 --retry 3 -o /tmp/boot_stock_magisk.img \
+            https://github.com/zhx57/android_kernel_sprd_sc9832e/releases/download/vp29-stock-boot/boot_stock_magisk.img
+          ls -l /tmp/boot_stock*.img
+
+      - name: Repack boot images (stock dtb, stock ramdisk)
+        run: |
+          set -e
+          MALI=$(find drivers/gpu/arm/midgard/mali -name mali.ko | head -n1)
+          SPRDWL=$(find drivers/misc/sprdwcn_bsp/sc2332 -name sprdwl_ng.ko | head -n1)
+          FM=$(find drivers/misc/sprdwcn_bsp/sipc_modules/fm -name sprd_fm.ko | head -n1)
+          BT=$(find drivers/misc/sprdwcn_bsp/sipc_modules/bluetooth -name sprdbt_tty.ko | head -n1)
+          echo "mali=$MALI sprdwl=$SPRDWL fm=$FM bt=$BT"
+          test -n "$MALI" && test -n "$SPRDWL" && test -n "$FM" && test -n "$BT"
+          python3 vp29/repack_boot.py --stock /tmp/boot_stock.img \
+            --kernel arch/arm64/boot/Image --out boot-VP29.img \
+            --mali "$MALI" --sprdwl "$SPRDWL" --fm "$FM" --bt "$BT"
+          python3 vp29/repack_boot.py --stock /tmp/boot_stock_magisk.img \
+            --dtb-image /tmp/boot_stock.img \
+            --kernel arch/arm64/boot/Image --out boot-VP29-magisk.img \
+            --mali "$MALI" --sprdwl "$SPRDWL" --fm "$FM" --bt "$BT"
+
+      - name: Strict verify (dtb + fstab must be stock)
+        run: |
+          python3 vp29/verify_strict.py boot-VP29.img /tmp/boot_stock.img
+          python3 vp29/verify_strict.py boot-VP29-magisk.img /tmp/boot_stock_magisk.img
+          echo '--- both images must carry the true stock dtb hash ---'
+          python3 -c "
+import hashlib,struct
+EXPECT='74ca112fbd3e2bae2f19353517ce3cc4c2718a7593cb2f76e27c9ca426fde772'
+def dtb_of(p):
+    d=open(p,'rb').read(); page=struct.unpack_from('<I',d,0x24)[0]
+    ks,rs,ss,ds=struct.unpack_from('<I',d,8)[0],struct.unpack_from('<I',d,0x10)[0],struct.unpack_from('<I',d,0x18)[0],struct.unpack_from('<I',d,0x28)[0]
+    pa=lambda n:(n+page-1)//page*page
+    off=pa(pa(page+ks)+rs)
+    return d[off:off+ds]
+for img in ('boot-VP29.img','boot-VP29-magisk.img'):
+    h=hashlib.sha256(dtb_of(img)).hexdigest()
+    print(img, h, 'STOCK' if h==EXPECT else 'MISMATCH')
+    assert h==EXPECT
+print('true stock dtb sha256 =', EXPECT)
+"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vp29-kernel-${{ github.run_number }}
+          path: |
+            boot-VP29.img
+            boot-VP29-magisk.img
+            arch/arm64/boot/Image
+            drivers/gpu/arm/midgard/mali/mali.ko
+            drivers/misc/sprdwcn_bsp/sc2332/sprdwl_ng.ko
+            .config
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view vp29-latest >/dev/null 2>&1 || \
+            gh release create vp29-latest --title "VP29 kernel 4.4.147-VP29" --notes "stock dtb + stock fstab + KernelSU"
+          gh release upload vp29-latest boot-VP29.img boot-VP29-magisk.img --clobber
