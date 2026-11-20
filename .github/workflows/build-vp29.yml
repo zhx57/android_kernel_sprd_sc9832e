@@ -109,21 +109,7 @@ jobs:
           python3 vp29/verify_strict.py boot-VP29.img /tmp/boot_stock.img
           python3 vp29/verify_strict.py boot-VP29-magisk.img /tmp/boot_stock_magisk.img
           echo '--- both images must carry the true stock dtb hash ---'
-          python3 -c "
-import hashlib,struct
-EXPECT='74ca112fbd3e2bae2f19353517ce3cc4c2718a7593cb2f76e27c9ca426fde772'
-def dtb_of(p):
-    d=open(p,'rb').read(); page=struct.unpack_from('<I',d,0x24)[0]
-    ks,rs,ss,ds=struct.unpack_from('<I',d,8)[0],struct.unpack_from('<I',d,0x10)[0],struct.unpack_from('<I',d,0x18)[0],struct.unpack_from('<I',d,0x28)[0]
-    pa=lambda n:(n+page-1)//page*page
-    off=pa(pa(page+ks)+rs)
-    return d[off:off+ds]
-for img in ('boot-VP29.img','boot-VP29-magisk.img'):
-    h=hashlib.sha256(dtb_of(img)).hexdigest()
-    print(img, h, 'STOCK' if h==EXPECT else 'MISMATCH')
-    assert h==EXPECT
-print('true stock dtb sha256 =', EXPECT)
-"
+          python3 vp29/check_stock_dtb.py boot-VP29.img boot-VP29-magisk.img
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
